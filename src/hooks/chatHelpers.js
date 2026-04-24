@@ -43,10 +43,14 @@ export function getConversationSortTimestamp(conversation) {
 }
 
 export function sortConversationsByNewestFirst(conversations) {
-  return [...conversations].sort(
-    (a, b) =>
-      getConversationSortTimestamp(b) - getConversationSortTimestamp(a)
-  );
+  return [...conversations].sort((a, b) => {
+    const aPending = !a.conversationId;
+    const bPending = !b.conversationId;
+    if (aPending !== bPending) {
+      return aPending ? -1 : 1;
+    }
+    return getConversationSortTimestamp(b) - getConversationSortTimestamp(a);
+  });
 }
 
 export function getStoredGlpiAuth() {

@@ -43,6 +43,7 @@ export default function App() {
     autoResize,
     createNewChat,
     sendMessage,
+    sendFileMessage,
     handleKeyDown,
     messagesLoading,
   } = useChat();
@@ -89,6 +90,7 @@ export default function App() {
           input={input}
           setInput={setInput}
           sendMessage={sendMessage}
+          sendFileMessage={sendFileMessage}
           handleKeyDown={handleKeyDown}
           textareaRef={textareaRef}
           autoResize={autoResize}

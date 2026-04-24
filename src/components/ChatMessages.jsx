@@ -1,4 +1,5 @@
 import TicketIntroBubble from "./TicketIntroBubble";
+import MessageMarkdown from "./MessageMarkdown";
 
 export default function ChatMessages({
   messages,
@@ -31,7 +32,11 @@ export default function ChatMessages({
             className={`message-row ${message.role === "user" ? "user" : "assistant"}`}
           >
             <div className={`message-bubble ${message.role}`}>
-              <p>{message.content}</p>
+              {message.role === "assistant" ? (
+                <MessageMarkdown content={message.content} />
+              ) : (
+                <p>{message.content}</p>
+              )}
             </div>
           </div>
         );

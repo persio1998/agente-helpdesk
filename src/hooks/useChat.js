@@ -5,12 +5,30 @@ import {
   sortConversationsByNewestFirst,
 } from "./chatHelpers";
 import {
+  ChatServiceError,
   createConversation,
+  getFileUploadMaxBytes,
   getConversationsByUser,
   getMessagesByConversationId,
+  getTicketById,
   sendChatAgentMessage,
   sendConversationMessage,
 } from "./chatService";
+
+const FILE_UPLOAD_MAX_BYTES = getFileUploadMaxBytes();
+
+function formatBytesToMB(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0";
+  return (bytes / (1024 * 1024)).toFixed(1);
+}
+
+function getFriendlySendErrorMessage(error) {
+  if (error instanceof ChatServiceError) {
+    return error.message;
+  }
+
+  return "Não consegui enviar o arquivo no momento.";
+}
 
 export default function useChat() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -66,7 +84,22 @@ export default function useChat() {
     );
   };
 
-  const fetchConversations = async () => {
+  const buildTicketFallbackFromConversation = (conversation) => {
+    const raw = conversation?.rawConversation || {};
+    const ticketId = conversation?.ticketId;
+    if (!ticketId) return null;
+
+    return {
+      id: String(raw.id_glpi ?? ticketId),
+      name: String(raw.nome_chamado ?? raw.titulo ?? raw.title ?? "").trim(),
+      status: raw.status ?? conversation?.status ?? null,
+      date: raw.dt_criacao ?? raw.date ?? null,
+      date_mod: raw.dt_atualizacao ?? raw.date_mod ?? null,
+      content: String(raw.content ?? raw.descricao ?? raw.mensagem ?? ""),
+    };
+  };
+
+  const fetchConversations = async (signal) => {
     setConversationsLoading(true);
 
     try {
@@ -74,7 +107,7 @@ export default function useChat() {
       const user = storedAuth.login?.trim();
       if (!user) return;
 
-      const conversations = await getConversationsByUser({ user });
+      const conversations = await getConversationsByUser({ user, signal });
       const fetchedConversations = conversations
         .map((item) => {
           const conversationId = item?.id_conversa
@@ -130,6 +163,7 @@ export default function useChat() {
         return sorted[0]?.id ?? null;
       });
     } catch (error) {
+      if (error?.name === "AbortError") return;
       console.error("Erro ao carregar chamados:", error);
     } finally {
       setConversationsLoading(false);
@@ -137,7 +171,9 @@ export default function useChat() {
   };
 
   useEffect(() => {
-    fetchConversations();
+    const controller = new AbortController();
+    fetchConversations(controller.signal);
+    return () => controller.abort();
   }, []);
 
   useEffect(() => {
@@ -171,6 +207,45 @@ export default function useChat() {
             return c;
           })
         );
+
+        const stillActiveConversation = conversationsRef.current.find(
+          (c) => c.id === activeConversationId
+        );
+        const shouldLoadTicketData =
+          msgs.length === 0 &&
+          !!stillActiveConversation?.ticketId &&
+          !stillActiveConversation?.rawTicket;
+
+        if (shouldLoadTicketData) {
+          try {
+            const ticket = await getTicketById({
+              ticketId: stillActiveConversation.ticketId,
+            });
+            if (cancelled) return;
+
+            updateConversationById(activeConversationId, (conversation) => ({
+              ...conversation,
+              rawTicket: ticket,
+              status: ticket.status ?? conversation.status,
+              title: ticket.name?.trim()
+                ? ticket.name.trim()
+                : conversation.title,
+            }));
+          } catch (ticketError) {
+            if (cancelled) return;
+
+            const fallbackTicket =
+              buildTicketFallbackFromConversation(stillActiveConversation);
+            if (fallbackTicket) {
+              updateConversationById(activeConversationId, (conversation) => ({
+                ...conversation,
+                rawTicket: fallbackTicket,
+              }));
+            }
+
+            console.error("Erro ao carregar dados do ticket:", ticketError);
+          }
+        }
       } catch (error) {
         console.error("Erro ao carregar mensagens:", error);
       } finally {
@@ -205,51 +280,81 @@ export default function useChat() {
     resetTextareaHeight();
   };
 
-  const sendMessage = async () => {
-    const text = input.trim();
-    if (!text || !activeConversation || isTyping) return;
+  const ensureConversationReady = async () => {
+    if (!activeConversation) return null;
 
     let currentConversation = activeConversation;
     let currentConversationId = activeConversation.id;
 
     if (!activeConversation.conversationId) {
-      try {
-        const storedAuth = getStoredGlpiAuth();
-        const user = storedAuth.login?.trim();
-
-        if (!user) {
-          throw new Error("Usuário não encontrado em glpi_auth.login.");
-        }
-
-        const { conversationId } = await createConversation({ user });
-        const nextConversationId = conversationId;
-        const nextSource = activeConversation.ticketId ? "hybrid" : "local";
-
-        updateConversationById(activeConversation.id, (conversation) => ({
-          ...conversation,
-          id: nextConversationId,
-          conversationId,
-          source: nextSource,
-        }));
-
-        currentConversation = {
-          ...activeConversation,
-          id: nextConversationId,
-          conversationId,
-          source: nextSource,
-        };
-        currentConversationId = nextConversationId;
-        setActiveConversationId(nextConversationId);
-      } catch (error) {
-        console.error("Erro ao criar id_conversa:", error);
-        appendMessageToConversation(currentConversationId, {
-          id: generateId("msg"),
-          role: "assistant",
-          content: "Não consegui iniciar a conversa agora.",
-          createdAt: new Date().toISOString(),
-        });
-        return;
+      const storedAuth = getStoredGlpiAuth();
+      const user = storedAuth.login?.trim();
+      if (!user) {
+        throw new Error("Usuário não encontrado em glpi_auth.login.");
       }
+
+      const { conversationId } = await createConversation({ user });
+      const nextConversationId = conversationId;
+      const nextSource = activeConversation.ticketId ? "hybrid" : "local";
+
+      updateConversationById(activeConversation.id, (conversation) => ({
+        ...conversation,
+        id: nextConversationId,
+        conversationId,
+        source: nextSource,
+      }));
+
+      currentConversation = {
+        ...activeConversation,
+        id: nextConversationId,
+        conversationId,
+        source: nextSource,
+      };
+      currentConversationId = nextConversationId;
+      setActiveConversationId(nextConversationId);
+    }
+
+    return { currentConversation, currentConversationId };
+  };
+
+  const readFileAsBase64 = (file) =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = String(reader.result || "");
+        const base64 = result.includes(",") ? result.split(",")[1] : result;
+        if (!base64) {
+          reject(new Error("Não foi possível converter arquivo para base64."));
+          return;
+        }
+        resolve(base64);
+      };
+      reader.onerror = () =>
+        reject(reader.error || new Error("Erro ao ler arquivo."));
+      reader.readAsDataURL(file);
+    });
+
+  const sendMessage = async () => {
+    const text = input.trim();
+    if (!text || !activeConversation || isTyping) return;
+
+    let currentConversation;
+    let currentConversationId;
+
+    try {
+      const ensured = await ensureConversationReady();
+      if (!ensured) return;
+      currentConversation = ensured.currentConversation;
+      currentConversationId = ensured.currentConversationId;
+    } catch (error) {
+      console.error("Erro ao criar id_conversa:", error);
+      appendMessageToConversation(activeConversation.id, {
+        id: generateId("msg"),
+        role: "assistant",
+        content: "Não consegui iniciar a conversa agora.",
+        createdAt: new Date().toISOString(),
+      });
+      return;
     }
 
     const userMessage = {
@@ -265,9 +370,15 @@ export default function useChat() {
     resetTextareaHeight();
 
     try {
+      const storedAuth = getStoredGlpiAuth();
+      const sessionToken = storedAuth.sessionToken || null;
+
       await sendConversationMessage({
         conversationId: currentConversation.conversationId,
         message: text,
+        messageType: "TEXTO",
+        ticketId: currentConversation.ticketId || null,
+        sessionToken,
       });
 
       const historyForAgent = [
@@ -290,6 +401,9 @@ export default function useChat() {
             conversationId: currentConversation.conversationId,
             message: assistantContent,
             remetente: "AGENT",
+            messageType: "TEXTO",
+            ticketId: currentConversation.ticketId || null,
+            sessionToken,
           });
         } catch (persistError) {
           console.error("Erro ao gravar resposta do agente:", persistError);
@@ -325,6 +439,87 @@ export default function useChat() {
     }
   };
 
+  const sendFileMessage = async (file) => {
+    if (!file || !activeConversation || isTyping) return;
+
+    let currentConversation;
+    let currentConversationId;
+
+    try {
+      const ensured = await ensureConversationReady();
+      if (!ensured) return;
+      currentConversation = ensured.currentConversation;
+      currentConversationId = ensured.currentConversationId;
+    } catch (error) {
+      console.error("Erro ao criar id_conversa para arquivo:", error);
+      appendMessageToConversation(activeConversation.id, {
+        id: generateId("msg"),
+        role: "assistant",
+        content: "Não consegui iniciar a conversa para enviar o arquivo.",
+        createdAt: new Date().toISOString(),
+      });
+      return;
+    }
+
+    appendMessageToConversation(currentConversationId, {
+      id: generateId("msg"),
+      role: "user",
+      content: `Arquivo enviado: ${file.name}`,
+      createdAt: new Date().toISOString(),
+    });
+
+    if (
+      Number.isFinite(file.size) &&
+      FILE_UPLOAD_MAX_BYTES > 0 &&
+      file.size > FILE_UPLOAD_MAX_BYTES
+    ) {
+      appendMessageToConversation(currentConversationId, {
+        id: generateId("msg"),
+        role: "assistant",
+        content: `Arquivo muito grande (${formatBytesToMB(
+          file.size
+        )} MB). Limite atual: ${formatBytesToMB(FILE_UPLOAD_MAX_BYTES)} MB.`,
+        createdAt: new Date().toISOString(),
+      });
+      return;
+    }
+
+    try {
+      const fileBase64 = await readFileAsBase64(file);
+      const storedAuth = getStoredGlpiAuth();
+      const sessionToken = storedAuth.sessionToken || null;
+
+      await sendConversationMessage({
+        conversationId: currentConversation.conversationId,
+        message: file.name,
+        messageType: "FILE",
+        ticketId: currentConversation.ticketId || null,
+        sessionToken,
+        fileName: file.name,
+        fileBase64,
+        fileMimeType: file.type || "application/octet-stream",
+        fileSize: Number.isFinite(file.size) ? file.size : null,
+      });
+    } catch (error) {
+      console.error("Erro ao enviar arquivo:", error);
+      appendMessageToConversation(currentConversationId, {
+        id: generateId("msg"),
+        role: "assistant",
+        content: getFriendlySendErrorMessage(error),
+        createdAt: new Date().toISOString(),
+      });
+      return;
+    }
+
+    setConversations((prev) =>
+      sortConversationsByNewestFirst(
+        prev.map((c) =>
+          c.id === currentConversationId ? { ...c, lastActivityAt: Date.now() } : c
+        )
+      )
+    );
+  };
+
   const handleKeyDown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -346,6 +541,7 @@ export default function useChat() {
     autoResize,
     createNewChat,
     sendMessage,
+    sendFileMessage,
     handleKeyDown,
     fetchConversations,
     conversationsLoading,

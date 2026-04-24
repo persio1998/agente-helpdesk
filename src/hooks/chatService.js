@@ -6,6 +6,51 @@ const MESSAGE_API_URL =
   "https://roadster.wheaton.com.br/webhook/glpi/api/message";
 const CHATBOT_WEBHOOK_URL =
   "https://roadster.wheaton.com.br/webhook/glpi/chatbot";
+const TICKET_DETAILS_WEBHOOK_URL =
+  process.env.REACT_APP_GLPI_TICKET_DETAILS_URL || "";
+const FILE_UPLOAD_MAX_BYTES = Number(
+  process.env.REACT_APP_FILE_UPLOAD_MAX_BYTES || 2 * 1024 * 1024
+);
+
+export class ChatServiceError extends Error {
+  constructor(message, { status = null, code = null } = {}) {
+    super(message);
+    this.name = "ChatServiceError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+export function getFileUploadMaxBytes() {
+  return FILE_UPLOAD_MAX_BYTES;
+}
+
+function bytesToMB(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0";
+  return (bytes / (1024 * 1024)).toFixed(1);
+}
+
+function buildHttpErrorMessage(status) {
+  if (status === 413) {
+    return `Arquivo maior que o limite permitido (${bytesToMB(
+      FILE_UPLOAD_MAX_BYTES
+    )} MB).`;
+  }
+  if (status >= 500) return "Servidor indisponível no momento.";
+  if (status === 401 || status === 403) return "Sessão inválida ou expirada.";
+  return `Erro ao enviar mensagem. Status ${status}`;
+}
+
+async function parseJsonSafely(response) {
+  const text = await response.text();
+  if (!text || String(text).trim() === "") return null;
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
 
 function parseResultadoToArray(data) {
   const firstItem = Array.isArray(data) ? data[0] : data;
@@ -77,15 +122,22 @@ export function normalizeApiMessageItem(item, index) {
   };
 }
 
-export async function getConversationsByUser({ user }) {
+export async function getConversationsByUser({ user, signal }) {
+  const storedAuth = getStoredGlpiAuth();
+  const sessionToken = storedAuth.sessionToken || null;
+  const login = String(user ?? storedAuth.login ?? "").trim();
+
   const url = new URL(CREATE_CONVERSATION_WEBHOOK_URL);
-  url.searchParams.set("user", user);
+  url.searchParams.set("user", login);
 
   const response = await fetch(url.toString(), {
     method: "GET",
     headers: {
       "Content-Type": "application/json",
+      ...(login ? { Login: login } : {}),
+      ...(sessionToken ? { "Session-Token": sessionToken } : {}),
     },
+    ...(signal ? { signal } : {}),
   });
 
   if (!response.ok) {
@@ -109,6 +161,65 @@ export async function getConversationsByUser({ user }) {
   if (!Array.isArray(parsedResult)) return [];
 
   return parsedResult;
+}
+
+function parseTicketResponseToObject(data) {
+  const items = parseResultadoToArray(data);
+  const first = Array.isArray(items) && items.length > 0 ? items[0] : null;
+  if (first && typeof first === "object") return first;
+
+  const direct = Array.isArray(data) ? data[0] : data;
+  if (direct && typeof direct === "object" && !direct.RESULTADO) return direct;
+  return null;
+}
+
+export async function getTicketById({ ticketId, signal }) {
+  if (!ticketId) {
+    throw new Error("ticketId é obrigatório para buscar chamado.");
+  }
+
+  if (!TICKET_DETAILS_WEBHOOK_URL) {
+    throw new Error("REACT_APP_GLPI_TICKET_DETAILS_URL não configurada.");
+  }
+
+  const storedAuth = getStoredGlpiAuth();
+  const sessionToken = storedAuth.sessionToken || null;
+  const login = String(storedAuth.login ?? "").trim();
+
+  const url = new URL(TICKET_DETAILS_WEBHOOK_URL);
+  url.searchParams.set("id_glpi", String(ticketId));
+  url.searchParams.set("id", String(ticketId));
+
+  const response = await fetch(url.toString(), {
+    method: "GET",
+    headers: {
+      "Content-Type": "application/json",
+      ...(login ? { Login: login } : {}),
+      ...(sessionToken ? { "Session-Token": sessionToken } : {}),
+    },
+    ...(signal ? { signal } : {}),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Erro ao buscar ticket. Status ${response.status}`);
+  }
+
+  const data = await response.json();
+  const ticket = parseTicketResponseToObject(data);
+
+  if (!ticket || typeof ticket !== "object") {
+    throw new Error("Resposta sem dados do ticket.");
+  }
+
+  return {
+    id: String(ticket.id ?? ticketId),
+    name: String(ticket.name ?? ticket.titulo ?? ticket.title ?? "").trim(),
+    status: ticket.status ?? null,
+    date: ticket.date ?? ticket.dt_criacao ?? null,
+    date_mod: ticket.date_mod ?? ticket.dt_atualizacao ?? null,
+    content: String(ticket.content ?? ticket.descricao ?? ticket.message ?? ""),
+    raw: ticket,
+  };
 }
 
 function isSaveAcknowledgementOnly(text) {
@@ -215,24 +326,56 @@ export async function sendConversationMessage({
   conversationId,
   message,
   remetente = "USER",
+  messageType = "TEXTO",
+  ticketId = null,
+  sessionToken = null,
+  fileName = null,
+  fileBase64 = null,
+  fileMimeType = null,
+  fileSize = null,
 }) {
-  const response = await fetch(MESSAGE_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      id_conversa: conversationId,
-      remetente,
-      mensagem: message,
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Erro ao enviar mensagem. Status ${response.status}`);
+  let response;
+  try {
+    response = await fetch(MESSAGE_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(sessionToken ? { "Session-Token": sessionToken } : {}),
+      },
+      body: JSON.stringify({
+        id_conversa: conversationId,
+        ...(ticketId
+          ? { id_glpi: String(ticketId), ticketId: String(ticketId) }
+          : {}),
+        ...(sessionToken ? { session_token: sessionToken } : {}),
+        remetente,
+        mensagem: message,
+        tipo_mensagem: messageType,
+        ...(fileName ? { nome_arquivo: fileName } : {}),
+        ...(fileBase64 ? { arquivo_base64: fileBase64 } : {}),
+        ...(fileMimeType ? { mime_type: fileMimeType } : {}),
+        ...(fileSize != null ? { tamanho_bytes: fileSize } : {}),
+      }),
+    });
+  } catch (error) {
+    throw new ChatServiceError(
+      "Falha de rede ao enviar mensagem. Verifique CORS/servidor.",
+      { code: "NETWORK_ERROR" }
+    );
   }
 
-  const data = await response.json();
+  if (!response.ok) {
+    throw new ChatServiceError(buildHttpErrorMessage(response.status), {
+      status: response.status,
+      code: response.status === 413 ? "PAYLOAD_TOO_LARGE" : "HTTP_ERROR",
+    });
+  }
+
+  const data = await parseJsonSafely(response);
+  if (data == null) {
+    return { assistantMessage: null, raw: null };
+  }
+
   return parseSendMessageResponse(data);
 }
 
