@@ -334,6 +334,13 @@ export async function sendConversationMessage({
   fileMimeType = null,
   fileSize = null,
 }) {
+  const normalizedMessageType =
+    String(messageType || "")
+      .trim()
+      .toUpperCase() === "FILE"
+      ? "FILE"
+      : "TEXTO";
+
   let response;
   try {
     response = await fetch(MESSAGE_API_URL, {
@@ -350,7 +357,7 @@ export async function sendConversationMessage({
         ...(sessionToken ? { session_token: sessionToken } : {}),
         remetente,
         mensagem: message,
-        tipo_mensagem: messageType,
+        tipo_mensagem: normalizedMessageType,
         ...(fileName ? { nome_arquivo: fileName } : {}),
         ...(fileBase64 ? { arquivo_base64: fileBase64 } : {}),
         ...(fileMimeType ? { mime_type: fileMimeType } : {}),
