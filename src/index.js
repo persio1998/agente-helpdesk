@@ -1,13 +1,58 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
+import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import './index.css';
 import App from './App';
+import LoginPage from "./pages/LoginPage";
 import reportWebVitals from './reportWebVitals';
+
+function hasGlpiSession() {
+  try {
+    const savedAuth = JSON.parse(localStorage.getItem("glpi_auth") || "{}");
+    return Boolean(savedAuth.sessionToken);
+  } catch {
+    return false;
+  }
+}
+
+function ProtectedRoute({ children }) {
+  if (!hasGlpiSession()) {
+    return <Navigate to="/login" replace />;
+  }
+  return children;
+}
+
+function PublicOnlyRoute({ children }) {
+  if (hasGlpiSession()) {
+    return <Navigate to="/" replace />;
+  }
+  return children;
+}
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(
   <React.StrictMode>
-    <App />
+    <BrowserRouter>
+      <Routes>
+        <Route
+          path="/"
+          element={
+            <ProtectedRoute>
+              <App />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/login"
+          element={
+            <PublicOnlyRoute>
+              <LoginPage />
+            </PublicOnlyRoute>
+          }
+        />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </BrowserRouter>
   </React.StrictMode>
 );
 

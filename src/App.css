@@ -700,6 +700,15 @@ textarea {
   cursor: pointer;
 }
 
+.login-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: #0d0d0d;
+}
+
 .chat-item-content {
   display: flex;
   flex-direction: column;
